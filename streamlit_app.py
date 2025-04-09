@@ -1,253 +1,205 @@
+# streamlit_app.py
 import streamlit as st
-import sqlite3
+from supabase import create_client, Client
 import hashlib
 import os
 import time
+from datetime import datetime
 
-# Function to hash passwords
+# Supabase Configuration
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Function to hash passwords (can be removed if using Supabase Auth fully)
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# Database Connection
-def get_db_connection():
-    conn = sqlite3.connect("data.db")
-    conn.row_factory = sqlite3.Row
-    return conn
-
 # Sign-up Function
 def sign_up(username, name, password):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    hashed_password = hash_password(password)
-    
-    try:
-        cursor.execute("INSERT INTO users (username, name, password) VALUES (?, ?, ?)", 
-                       (username, name, hashed_password))
-        conn.commit()
+    res = supabase.auth.sign_up({"email": username, "password": password, "data": {"full_name": name}})
+    if res.error:
+        st.error(f"⚠️ Sign up failed: {res.error.message}")
+    else:
         st.success("✅ Account created! You can now log in.")
-    except sqlite3.IntegrityError:
-        st.error("⚠️ Username already exists!")
-    
-    conn.close()
 
 # Sign-in Function
 def sign_in(username, password):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    hashed_password = hash_password(password)
-    
-    cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?", 
-                   (username, hashed_password))
-    user = cursor.fetchone()
-    conn.close()
-    
-    return user
+    res = supabase.auth.sign_in_with_password({"email": username, "password": password})
+    if res.error:
+        st.error("❌ Invalid username or password")
+        return None
+    else:
+        return res.data.user
 
 # Get List of Users
 def get_users():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT username FROM users")
-    users = [row["username"] for row in cursor.fetchall()]
-    conn.close()
-    return users
+    response = supabase.from_("users").select("username").execute()
+    if response.error:
+        st.error(f"Error fetching users: {response.error.message}")
+        return []
+    else:
+        return [row["username"] for row in response.data]
 
 # Send Message
 def send_message(sender, receiver, message, attachment=None, group_name=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("INSERT INTO messages (sender, receiver, group_name, message, attachment) VALUES (?, ?, ?, ?, ?)", 
-                   (sender, receiver, group_name, message, attachment))
-    conn.commit()
-    conn.close()
+    message_data = {"sender": sender, "receiver": receiver, "group_name": group_name, "message": message, "attachment": attachment}
+    response = supabase.from_("messages").insert(message_data).execute()
+    if response.error:
+        st.error(f"Error sending message: {response.error.message}")
 
 # Get Messages
 def get_messages(sender, receiver, group_name=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
     if group_name:
-        cursor.execute("SELECT sender, message, timestamp FROM messages WHERE group_name = ? ORDER BY timestamp", (group_name,))
+        response = supabase.from_("messages").select("sender, message, created_at").eq("group_name", group_name).order("created_at").execute()
     else:
-        cursor.execute("SELECT sender, message, timestamp, seen FROM messages WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?) ORDER BY timestamp", 
-                       (sender, receiver, receiver, sender))
-    
-    messages = cursor.fetchall()
-    conn.close()
-    
-    return messages
+        response = supabase.from_("messages").select("sender, message, created_at, seen").or_(f"and(sender.eq.{sender}, receiver.eq.{receiver}),and(sender.eq.{receiver}, receiver.eq.{sender})").order("created_at").execute()
+    if response.error:
+        st.error(f"Error fetching messages: {response.error.message}")
+        return []
+    else:
+        return response.data
 
 # Mark Messages as Seen
 def mark_messages_as_seen(sender, receiver):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE messages SET seen = 1 WHERE sender = ? AND receiver = ?", (sender, receiver))
-    conn.commit()
-    conn.close()
+    response = supabase.from_("messages").update({"seen": True}).eq("sender", sender).eq("receiver", receiver).execute()
+    if response.error:
+        st.error(f"Error marking messages as seen: {response.error.message}")
 
-# Save File
-def save_file(user, file_name, file_path):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO files (user, file_name, file_path) VALUES (?, ?, ?)", 
-                   (user, file_name, file_path))
-    conn.commit()
-    conn.close()
+# Save File to Supabase Storage
+def save_file_to_supabase(user_id, file):
+    try:
+        file_name = file.name
+        bucket_name = "your-storage-bucket-name"  # Replace with your bucket name
+        file_path = f"{user_id}/{file_name}"
+        response = supabase.storage.from_(bucket_name).upload(file_path, file.getvalue())
+        if response.error:
+            st.error(f"Error uploading file to Supabase Storage: {response.error.message}")
+            return None
+        else:
+            file_url = supabase.storage.from_(bucket_name).get_public_url(file_path)
+            # Optionally store the file URL in your database
+            supabase.from_("files").insert({"user_id": user_id, "file_name": file_name, "file_path": file_url}).execute()
+            return file_url
+    except Exception as e:
+        st.error(f"Error saving file to Supabase Storage: {e}")
+        return None
 
-# Fetch Saved Files
-def fetch_files(user):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_name, file_path FROM files WHERE user = ?", (user,))
-    files = cursor.fetchall()
-    conn.close()
-    return files
+# Fetch Saved Files (Adjust based on how you store file info)
+def fetch_files(user_id):
+    response = supabase.from_("files").select("file_name, file_path").eq("user_id", user_id).execute()
+    if response.error:
+        st.error(f"Error fetching files: {response.error.message}")
+        return []
+    else:
+        return response.data
 
 # Notifications
 def send_notification(user, message):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO notifications (user, message) VALUES (?, ?)", 
-                   (user, message))
-    conn.commit()
-    conn.close()
+    response = supabase.from_("notifications").insert({"user_id": user, "message": message}).execute()
+    if response.error:
+        st.error(f"Error sending notification: {response.error.message}")
 
 def get_notifications(user):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT message, timestamp FROM notifications WHERE user = ?", (user,))
-    notifications = cursor.fetchall()
-    conn.close()
-    return notifications
+    response = supabase.from_("notifications").select("message, created_at").eq("user_id", user).order("created_at", desc=True).execute()
+    if response.error:
+        st.error(f"Error fetching notifications: {response.error.message}")
+        return []
+    else:
+        return response.data
 
 # Streamlit App UI
 st.title("🔵 Chat App")
 
 # Session state for authentication
-if "username" not in st.session_state:
-    st.session_state["username"] = None
+if "user" not in st.session_state:
+    st.session_state["user"] = None
 
 # Authentication System
-if st.session_state["username"]:
-    st.sidebar.write(f"✅ Logged in as: **{st.session_state['username']}**")
+if st.session_state["user"]:
+    st.sidebar.write(f"✅ Logged in as: **{st.session_state['user'].email}**")
 
     if st.sidebar.button("🔴 Log Out"):
-        st.session_state["username"] = None
+        supabase.auth.sign_out()
+        st.session_state["user"] = None
         st.rerun()
 else:
     option = st.sidebar.radio("🔐 Login / Sign Up", ["Login", "Sign Up"])
-    
+
     if option == "Sign Up":
-        new_username = st.text_input("🆔 Username")
+        new_username = st.text_input("🆔 Username (Email)")
         new_name = st.text_input("📛 Full Name")
         new_password = st.text_input("🔑 Password", type="password")
         if st.button("📝 Create Account"):
             sign_up(new_username, new_name, new_password)
-    
+
     elif option == "Login":
-        username = st.text_input("🆔 Username")
+        username = st.text_input("🆔 Username (Email)")
         password = st.text_input("🔑 Password", type="password")
         if st.button("🔓 Login"):
             user = sign_in(username, password)
             if user:
-                st.session_state["username"] = username
+                st.session_state["user"] = user
                 st.rerun()
             else:
                 st.error("❌ Invalid username or password")
 
 # Chat UI
-if st.session_state["username"]:
+if st.session_state["user"]:
     st.subheader("💬 Chat")
 
     user_list = get_users()
-    selected_user = st.selectbox("📜 Select a User to Chat", user_list)
+    logged_in_username = st.session_state["user"].email
+    if logged_in_username in user_list:
+        user_list.remove(logged_in_username) # Don't show logged-in user in the list
 
-    if selected_user and selected_user != st.session_state["username"]:
+    selected_user = st.selectbox("📜 Select a User to Chat", [""] + user_list) # Added an empty option
+
+    if selected_user:
         st.subheader(f"Chat with {selected_user}")
-        
+
         chat_container = st.empty()
         chat_input = st.text_input("📝 Type your message...")
-        
+
         if st.button("📤 Send"):
             if chat_input.strip():
-                send_message(st.session_state["username"], selected_user, chat_input)
+                send_message(logged_in_username, selected_user, chat_input)
                 chat_input = ""  # Clear input field
             else:
                 st.warning("⚠️ Cannot send an empty message!")
 
         # Auto-refresh every 5 seconds
         while True:
-            messages = get_messages(st.session_state["username"], selected_user)
+            messages = get_messages(logged_in_username, selected_user)
             with chat_container.container():
                 st.write("---")
                 for msg in messages:
-                    seen_status = "✔✔ Seen" if msg["seen"] else "✔ Delivered"
-                    st.write(f"**{msg['sender']}**: {msg['message']} ({seen_status})")
+                    seen_status = "✔✔ Seen" if msg.get("seen") else "✔ Delivered"
+                    st.write(f"**{msg['sender']}**: {msg['message']} ({seen_status}) ({msg['created_at']})")
                 st.write("---")
             time.sleep(5)  # Refresh every 5 seconds
 
     # Settings UI
     if st.sidebar.button("⚙️ Settings"):
         st.subheader("🔧 Settings")
-
-        current_password = st.text_input("🔑 Enter Current Password", type="password")
-
-        if st.button("🔄 Change Username"):
-            new_username = st.text_input("🆔 New Username")
-            if st.button("Update Username"):
-                # Check current password
-                user = sign_in(st.session_state["username"], current_password)
-                if user:
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE users SET username = ? WHERE username = ?", (new_username, st.session_state["username"]))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"✅ Username changed to {new_username}")
-                    st.session_state["username"] = new_username
-                    st.rerun()
-
-        if st.button("🔄 Change Name"):
-            new_name = st.text_input("📛 New Name")
-            if st.button("Update Name"):
-                # Check current password
-                user = sign_in(st.session_state["username"], current_password)
-                if user:
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE users SET name = ? WHERE username = ?", (new_name, st.session_state["username"]))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"✅ Name changed to {new_name}")
-                    st.rerun()
-
-        if st.button("🔄 Change Password"):
-            new_password = st.text_input("🔑 New Password", type="password")
-            if st.button("Update Password"):
-                # Check current password
-                user = sign_in(st.session_state["username"], current_password)
-                if user:
-                    hashed_new_password = hash_password(new_password)
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE users SET password = ? WHERE username = ?", (hashed_new_password, st.session_state["username"]))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"✅ Password updated successfully")
-                    st.rerun()
+        st.write("User settings can be managed through the Supabase Auth dashboard.")
 
     # File Upload & Download
     uploaded_file = st.file_uploader("📤 Upload File", type=['exe', 'apk', 'py', 'mp4', 'txt', 'pdf'])
     if uploaded_file:
-        save_path = f"uploads/{uploaded_file.name}"
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        save_file(st.session_state["username"], uploaded_file.name, save_path)
-        st.success(f"File {uploaded_file.name} uploaded successfully!")
+        if st.session_state["user"] and st.session_state["user"].id:
+            file_url = save_file_to_supabase(st.session_state["user"].id, uploaded_file)
+            if file_url:
+                st.success(f"File {uploaded_file.name} uploaded successfully! URL: {file_url}")
+        else:
+            st.warning("User ID not found. Please log in.")
 
     # View Saved Files
     st.subheader("📂 View Saved Files")
-    files = fetch_files(st.session_state["username"])
-    for file in files:
-        st.download_button(f"📥 Download {file['file_name']}", file['file_path'])
+    if st.session_state["user"] and st.session_state["user"].id:
+        files = fetch_files(st.session_state["user"].id)
+        for file in files:
+            st.write(f"📄 {file['file_name']}")
+            st.write(f"🔗 Link: {file['file_path']}") # Display the link, you might want to create a download button with the URL
+    else:
+        st.info("Please log in to view saved files.")
